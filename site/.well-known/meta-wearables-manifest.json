@@ -3,10 +3,23 @@
   "name": "Glass Orbit",
   "description": "Anti-gravity racing on six orbital circuits against rivals. Tilt your head or swipe to steer.",
   "appearance": {
-    "theme_color": "#7FD8FF",
+    "theme_color": "#FFFFFF",
     "icon": {
       "src": "icon.png",
       "type": "monochrome"
+    },
+    "icon_background": {
+      "colors": [
+        "#FF6A3D",
+        "#B0180E",
+        "#3A0604"
+      ],
+      "stops": [
+        0.0,
+        0.55,
+        1.0
+      ],
+      "inner_glow_color": "#FFB08A"
     }
   }
 }
