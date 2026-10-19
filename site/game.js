@@ -11,7 +11,7 @@
 
 import { THREE, makeRenderer, canvasTexture, glowSprite, starfield, buildTrack, along, trackPoint, trackStrip, trackMatrix, leftOf, chaseCamera, frameClock, hudText } from './kit3d.js';
 
-const VERSION = '2.0.0';
+const VERSION = '3.0.0';
 const { g, label, clamp, lerp, rand, beep, noise, head, store } = GK;
 
 const HW = 9;                 // half track width, m
@@ -58,8 +58,71 @@ scene.add(new THREE.HemisphereLight(0xb8c8ff, 0x202030, 0.9));
 const sun = new THREE.DirectionalLight(0xffffff, 1.4);
 sun.position.set(300, 500, 200);
 scene.add(sun);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
 const stars = starfield(1400, 4000, 0xdfe8ff, 1.6);
 scene.add(stars);
+
+// Painted sky: soft nebula clouds and a dense star field on a dome that travels with the camera.
+const NEB = {
+  moon: ['#0a1838', '#2a3a7a', '#5a7ac8'], ring: ['#160a30', '#4a2a8a', '#9a6ad8'], rocks: ['#200e08', '#6a3418', '#c87a3a'],
+  giant: ['#04181c', '#0e5a5a', '#4ac8aa'], sun: ['#200806', '#7a2010', '#ff9a4a'], nebula: ['#180626', '#7a1a7a', '#ff5ad8'],
+};
+function nebulaTexture(cols) {
+  return canvasTexture(1024, 512, (c, w, h) => {
+    c.fillStyle = '#000'; c.fillRect(0, 0, w, h);
+    for (let i = 0; i < 70; i++) {
+      const x = Math.random() * w, y = h * (0.15 + Math.random() * 0.7), r = 60 + Math.random() * 220;
+      const grd = c.createRadialGradient(x, y, 0, x, y, r);
+      grd.addColorStop(0, cols[i % 3]); grd.addColorStop(1, 'rgba(0,0,0,0)');
+      c.globalAlpha = 0.12 + Math.random() * 0.18; c.fillStyle = grd; c.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+    c.globalAlpha = 1;
+    for (let i = 0; i < 3500; i++) { const b = Math.random(); c.fillStyle = `rgba(255,255,255,${b * b})`; c.fillRect(Math.random() * w, Math.random() * h, b > 0.95 ? 2 : 1, b > 0.95 ? 2 : 1); }
+  });
+}
+const dome = new THREE.Mesh(new THREE.SphereGeometry(6000, 48, 24), new THREE.MeshBasicMaterial({ side: THREE.BackSide, fog: false, depthWrite: false }));
+scene.add(dome);
+
+// Speed streaks: thin lines that rush past the camera at high speed.
+const STREAKS = 70;
+const streaks = new THREE.InstancedMesh(new THREE.BoxGeometry(0.012, 0.012, 2.5), new THREE.MeshBasicMaterial({ color: 0xbfe8ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }), STREAKS);
+streaks.frustumCulled = false;
+scene.add(streaks);
+const streakPos = [];
+for (let i = 0; i < STREAKS; i++) { const a = Math.random() * Math.PI * 2, r = 5 + Math.random() * 10; streakPos.push(new THREE.Vector3(Math.cos(a) * r, Math.sin(a) * r * 0.7, -Math.random() * 60)); }
+
+// Engine trails: fading ribbons behind every ship.
+class Trail {
+  constructor(colour, width) {
+    this.n = 28; this.width = width; this.pts = [];
+    const g2 = new THREE.BufferGeometry();
+    this.pos = new Float32Array(this.n * 2 * 3); this.col = new Float32Array(this.n * 2 * 3);
+    g2.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    g2.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
+    const idx = [];
+    for (let i = 0; i < this.n - 1; i++) { const a = i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    g2.setIndex(idx);
+    this.mesh = new THREE.Mesh(g2, new THREE.MeshBasicMaterial({ vertexColors: true, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    this.mesh.frustumCulled = false;
+    this.c = new THREE.Color(colour);
+    scene.add(this.mesh);
+  }
+  push(p, side) {
+    this.pts.unshift([p.x, p.y, p.z, side.x, side.y, side.z]);
+    if (this.pts.length > this.n) this.pts.pop();
+    for (let i = 0; i < this.n; i++) {
+      const q = this.pts[Math.min(i, this.pts.length - 1)] || [p.x, p.y, p.z, 0, 0, 0];
+      const f = 1 - i / this.n, w = this.width * (0.3 + f * 0.7);
+      this.pos.set([q[0] + q[3] * w, q[1] + q[4] * w, q[2] + q[5] * w, q[0] - q[3] * w, q[1] - q[4] * w, q[2] - q[5] * w], i * 6);
+      const k = f * f * 0.45;
+      this.col.set([this.c.r * k, this.c.g * k, this.c.b * k, this.c.r * k, this.c.g * k, this.c.b * k], i * 6);
+    }
+    this.mesh.geometry.attributes.position.needsUpdate = true;
+    this.mesh.geometry.attributes.color.needsUpdate = true;
+  }
+  reset() { this.pts.length = 0; }
+}
 
 /* -------------------------------------------------------------- textures */
 
@@ -126,7 +189,18 @@ function makeShip(team) {
 
 /* ----------------------------------------------------------------- world */
 
-let T = null, world = null, circuit = CIRCUITS[0], pads = [];
+let T = null, world = null, circuit = CIRCUITS[0], pads = [], edgeLights = null, edgeLightN = 0;
+const signMats = {};
+function signMat(c) {
+  if (signMats[c.name]) return signMats[c.name];
+  const tex = canvasTexture(512, 76, (x, w, h) => {
+    x.fillStyle = '#0a0e16'; x.fillRect(0, 0, w, h);
+    x.fillStyle = '#' + new THREE.Color(c.edge).getHexString(); x.fillRect(0, 0, w, 5); x.fillRect(0, h - 5, w, 5);
+    x.font = 'italic 900 40px Helvetica, Arial'; x.textAlign = 'left'; x.fillStyle = '#fff'; x.fillText('ORB', 20, 54); x.fillStyle = '#ff5a3a'; x.fillText('IT', 104, 54);
+    x.font = '800 30px Helvetica, Arial'; x.textAlign = 'right'; x.fillStyle = '#' + new THREE.Color(c.edge).getHexString(); x.fillText(c.name.toUpperCase(), w - 20, 50);
+  });
+  return (signMats[c.name] = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+}
 
 function buildWorld(c) {
   if (world) { scene.remove(world); world.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); }
@@ -154,18 +228,37 @@ function buildWorld(c) {
     for (const side of [1, -1]) { const post = new THREE.Mesh(new THREE.BoxGeometry(0.8, 12, 0.8), gantryMat); post.position.set(side * (HW + 1.4), 6, 0); grp.add(post); }
     const beam = new THREE.Mesh(new THREE.BoxGeometry(2 * HW + 3.6, 1.2, 1.2), gantryMat); beam.position.y = 12; grp.add(beam);
     const strip = new THREE.Mesh(new THREE.BoxGeometry(2 * HW + 3.6, 0.25, 0.2), stripMat); strip.position.set(0, 11.3, -0.62); grp.add(strip);
+    const sign = new THREE.Mesh(new THREE.PlaneGeometry(12, 1.8), signMat(c)); sign.position.set(0, 13.5, -0.7); sign.rotation.y = Math.PI; grp.add(sign);
+    const signBack = sign.clone(); signBack.position.z = 0.7; signBack.rotation.y = 0; grp.add(signBack);
+    const box = new THREE.Mesh(new THREE.BoxGeometry(12.4, 2.2, 1.2), gantryMat); box.position.y = 13.5; grp.add(box);
     grp.applyMatrix4(trackMatrix(T, s, 0));
     world.add(grp);
   }
-  // Pylons down into space under the deck.
-  const pylon = new THREE.InstancedMesh(new THREE.BoxGeometry(1.2, 80, 1.2), new THREE.MeshLambertMaterial({ color: 0x1a1e28 }), Math.ceil(T.len / 90) * 2);
-  let pc = 0;
-  for (let s = 0; s < T.len; s += 90) for (const side of [1, -1]) {
-    const p = trackPoint(T, s, side * (HW - 2), -41);
-    pylon.setMatrixAt(pc++, new THREE.Matrix4().makeTranslation(p.x, p.y, p.z));
+  // Truss under the deck: a lower chord either side and diagonal struts, lit from below.
+  const steel = new THREE.MeshStandardMaterial({ color: 0x2a3040, metalness: 0.7, roughness: 0.4 });
+  for (const side of [1, -1]) world.add(new THREE.Mesh(trackStrip(T, side * (HW - 1), side * (HW - 1.6), -6, -6.6), steel));
+  const strutN = Math.ceil(T.len / 12) * 2;
+  const struts = new THREE.InstancedMesh(new THREE.BoxGeometry(0.35, 6.4, 0.35), steel, strutN);
+  let sc = 0;
+  for (let s = 0; s < T.len; s += 12) for (const side of [1, -1]) {
+    const m = trackMatrix(T, s, side * (HW - 1.2), -3.6).clone().multiply(new THREE.Matrix4().makeRotationX((Math.floor(s / 12) % 2 ? 1 : -1) * 0.75));
+    struts.setMatrixAt(sc++, m);
   }
-  pylon.count = pc;
-  world.add(pylon);
+  struts.count = sc; world.add(struts);
+  const underGlow = new THREE.Mesh(trackStrip(T, HW - 1, -HW + 1, -6.7, -6.7), new THREE.MeshBasicMaterial({ color: c.edge, transparent: true, opacity: 0.12, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+  world.add(underGlow);
+  // Tall pylons now and then, down into space.
+  const pylon = new THREE.InstancedMesh(new THREE.BoxGeometry(1.4, 80, 1.4), steel, Math.ceil(T.len / 270) * 2);
+  let pc = 0;
+  for (let s = 0; s < T.len; s += 270) for (const side of [1, -1]) { const p = trackPoint(T, s, side * (HW - 2), -46); pylon.setMatrixAt(pc++, new THREE.Matrix4().makeTranslation(p.x, p.y, p.z)); }
+  pylon.count = pc; world.add(pylon);
+  // Chasing lights set into both edges of the deck.
+  edgeLightN = Math.floor(T.len / 8) * 2;
+  edgeLights = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.1, 1.2), new THREE.MeshBasicMaterial({ color: 0xffffff }), edgeLightN);
+  let ec = 0;
+  for (let s = 0; s < T.len - 4; s += 8) for (const side of [1, -1]) { edgeLights.setMatrixAt(ec, trackMatrix(T, s, side * (HW - 0.55), 0.08)); edgeLights.setColorAt(ec, new THREE.Color(c.edge)); ec++; }
+  edgeLights.count = edgeLightN = ec;
+  world.add(edgeLights);
   // Speed pads: glowing arrows on a third of the track width.
   pads = [];
   const padMat = new THREE.MeshBasicMaterial({ map: padTex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
@@ -182,6 +275,7 @@ function buildWorld(c) {
   start.rotation.x = -Math.PI / 2;
   const sg = new THREE.Group(); sg.add(start); sg.position.y = 0.05; sg.applyMatrix4(trackMatrix(T, 0, 0)); world.add(sg);
   buildTheme(c);
+  dome.material.map = nebulaTexture(NEB[c.theme]); dome.material.needsUpdate = true;
   scene.add(world);
 }
 
@@ -211,6 +305,7 @@ function themeObjects(c) {
     const planet = new THREE.Mesh(new THREE.SphereGeometry(t === 'moon' ? 700 : 1500, 48, 32), new THREE.MeshLambertMaterial({ map: tex }));
     planet.position.set(cx + 900, -700, cz + 4200);
     world.add(planet);
+    const atm = glowSprite(t === 'moon' ? 0x8ab0ff : 0x5affd0, (t === 'moon' ? 700 : 1500) * 2.7); atm.material.opacity = 0.55; atm.position.copy(planet.position); world.add(atm);
     if (t === 'giant') {
       const ring = new THREE.Mesh(new THREE.RingGeometry(1900, 2600, 96), new THREE.MeshBasicMaterial({ color: 0x8ad8c8, transparent: true, opacity: 0.35, side: THREE.DoubleSide }));
       ring.position.copy(planet.position); ring.rotation.x = -1.35; world.add(ring);
@@ -223,6 +318,7 @@ function themeObjects(c) {
     world.add(lights);
     const planet = new THREE.Mesh(new THREE.SphereGeometry(500, 32, 24), new THREE.MeshLambertMaterial({ map: planetTexture(['#3a5a9a', '#2a4a7a', '#5a7aba']) }));
     planet.position.set(cx - 2200, -400, cz + 3600); world.add(planet);
+    const atm = glowSprite(0x6a9aff, 1350); atm.material.opacity = 0.55; atm.position.copy(planet.position); world.add(atm);
   } else if (t === 'rocks') {
     const rock = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1, 0), new THREE.MeshLambertMaterial({ color: 0x6a5a48 }), 420);
     const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
@@ -236,6 +332,7 @@ function themeObjects(c) {
     world.add(rock);
     const planet = new THREE.Mesh(new THREE.SphereGeometry(900, 40, 28), new THREE.MeshLambertMaterial({ map: planetTexture(['#b07040', '#8a5030', '#c89060', '#704020']) }));
     planet.position.set(cx + 2600, -200, cz - 3200); world.add(planet);
+    const atm = glowSprite(0xffb070, 2400); atm.material.opacity = 0.5; atm.position.copy(planet.position); world.add(atm);
   } else if (t === 'sun') {
     const s = glowSprite(0xffa04a, 2600); s.position.set(cx + 1200, 400, cz + 2600); world.add(s);
     const core = new THREE.Mesh(new THREE.SphereGeometry(500, 32, 24), new THREE.MeshBasicMaterial({ color: 0xffd28a, fog: false }));
@@ -256,6 +353,7 @@ let steerMode = store.get('orbit.steer', 0);           // 0 swipe, 1 tilt, 2 tur
 let bestLaps = store.get('orbit.best', {});
 const playerMesh = makeShip(TEAMS[0]);
 const rivalMeshes = TEAMS.slice(1).map(makeShip);
+const trails = [new Trail(0x8ad8ff, 0.16)].concat(TEAMS.slice(1).map((t) => new Trail(t.body, 0.13)));
 
 function newShip() { return { s: 0, x: 0, target: 0, speed: 0, energy: 1, boost: 0, brake: 0, lap: 1, lapTimes: [], bumped: 0, tilt: 0, done: false }; }
 
@@ -418,6 +516,39 @@ function render3d(now) {
   // Stiff follow: at 100 m/s a soft spring would leave the ship tiny in the distance.
   chase.update(want, at, dt, 30, -p.bank * 0.5);
   stars.position.copy(camera.position);
+  dome.position.copy(camera.position);
+  // Engine trails from each ship's nozzle.
+  const shipsNow = [[playerMesh, 0]].concat(rivals.map((r, i) => [r.mesh, i + 1]));
+  for (const [m, i] of shipsNow) {
+    if (!m.visible) { trails[i].reset(); trails[i].mesh.visible = false; continue; }
+    trails[i].mesh.visible = true;
+    m.updateMatrixWorld();
+    const nz = new THREE.Vector3(0, 0.42, -2.7).applyMatrix4(m.matrixWorld), sd = new THREE.Vector3(1, 0, 0).applyQuaternion(m.quaternion);
+    trails[i].push(nz, sd);
+  }
+  for (let i = shipsNow.length; i < trails.length; i++) trails[i].mesh.visible = false;
+  // Edge lights: a wave of brightness running forward along the deck.
+  if (edgeLights) {
+    const base = new THREE.Color(circuit.edge), cc = new THREE.Color();
+    for (let i = 0; i < edgeLightN; i++) {
+      const sPos = (i >> 1) * 8;
+      const w = Math.pow(Math.max(0, Math.sin(sPos * 0.035 - now / 90)), 10);
+      edgeLights.setColorAt(i, cc.copy(base).multiplyScalar(0.35 + w * 1.6));
+    }
+    edgeLights.instanceColor.needsUpdate = true;
+  }
+  // Speed streaks in camera space.
+  const sp = clamp(((s.speed || 0) - MAX * 0.55) / (MAX * 0.6), 0, 1) + (s.boost > 0 ? 0.5 : 0);
+  streaks.material.opacity = Math.min(0.45, sp * 0.4);
+  const mm = new THREE.Matrix4();
+  camera.updateMatrixWorld();
+  for (let i = 0; i < STREAKS; i++) {
+    const q = streakPos[i];
+    q.z += (s.speed || 0) * dt * 1.3;
+    if (q.z > 2) q.z -= 62;
+    streaks.setMatrixAt(i, mm.makeTranslation(q.x, q.y, q.z).premultiply(camera.matrixWorld));
+  }
+  streaks.instanceMatrix.needsUpdate = true;
   camera.fov = 64 + clamp(((s.speed || 0) - 60) / MAX, 0, 1) * 8 + (s.boost > 0 ? 6 : 0);
   camera.updateProjectionMatrix();
   renderer.render(scene, camera);
